@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: license-server
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: postgresql://tkt_fastapi_db_user:zs99uW8RHwtZCgQK9pm3iQeLU6jhxWU9@dpg-d2vvguadbo4c73b3tq70-a/tkt_fastapi_db
+        value: change-me
+      - key: PRIVATE_KEY_PEM
+        sync: false    # đặt thủ công trong Dashboard (paste PEM)
+      - key: PUBLIC_KEY_PEM
+        sync: false    # đặt thủ công trong Dashboard (paste PEM)
+      - key: DATABASE_URL
+        fromDatabase:
+          name: tkt_fastapi_db
+          property: connectionString
+
+databases:
+  - name: license-db
+    plan: free

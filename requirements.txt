@@ -1,7 +1,8 @@
 fastapi
-uvicorn
 sqlmodel
 psycopg2-binary
 cryptography
 msgpack
 python-dotenv
+uvicorn[standard]
+gunicorn
