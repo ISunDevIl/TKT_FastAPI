@@ -6,3 +6,4 @@ msgpack
 python-dotenv
 uvicorn[standard]
 gunicorn
+sqladmin
