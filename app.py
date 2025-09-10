@@ -1,11 +1,11 @@
 import os, time, datetime
 from typing import Optional, List
-from fastapi import FastAPI, HTTPException, Depends, Query
+from fastapi import FastAPI, HTTPException, Depends, Query, Response
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from sqlmodel import SQLModel, Field, Session, create_engine, select
 from security import load_keys_from_env, kid_from_pub, sign_token, verify_token
-
+from fastapi.responses import HTMLResponse, FileResponse
 # ================== Config ==================
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "change-me")
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./data.db")  # Render sẽ override bằng Postgres
@@ -46,6 +46,7 @@ PUB_PEM = None
 KID = None
 
 # ================== App ==================
+BOOT_TS = time.time()
 app = FastAPI(title="License Server (Render)", version="1.0.0")
 
 @app.on_event("startup")
@@ -59,6 +60,38 @@ def startup():
 @app.get("/health")
 def health():
     return {"ok": True, "kid": KID}
+
+@app.get("/", response_class=HTMLResponse)
+def index():
+    # Hiển thị thông tin cơ bản + link nhanh
+    _, pub = load_keys_from_env()
+    kid = kid_from_pub(pub)
+    uptime = round(time.time() - BOOT_TS, 2)
+    return f"""<!doctype html>
+<html><head><meta charset="utf-8"><title>TKT FastAPI</title></head>
+<body style="font-family:system-ui; max-width:720px; margin:40px auto; line-height:1.6">
+  <h1>✅ TKT FastAPI is live</h1>
+  <p>Uptime: <b>{uptime}s</b></p>
+  <p>Active KID: <code>{kid}</code></p>
+  <ul>
+    <li><a href="/healthz">/healthz</a></li>
+    <li><a href="/ready">/ready</a></li>
+    <li><a href="/docs">/docs</a> (nếu bạn không ẩn docs ở prod)</li>
+  </ul>
+</body></html>"""
+
+@app.head("/")
+def index_head():
+    # Render đôi khi gửi HEAD / để thăm dò; trả 200 cho sạch log
+    return Response(status_code=200)
+
+@app.get("/favicon.ico")
+def favicon():
+    # Nếu có file favicon, phục vụ; nếu không, trả 204 cho đỡ 404
+    path = os.path.join(os.path.dirname(__file__), "static", "favicon.ico")
+    if os.path.exists(path):
+        return FileResponse(path, media_type="image/x-icon")
+    return Response(status_code=204)
 
 # ====== Schemas ======
 class LicenseCreate(BaseModel):
