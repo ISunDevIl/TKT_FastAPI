@@ -1,4 +1,4 @@
-import os, time, datetime
+import os, time, datetime, base64
 from typing import Optional, List
 from fastapi import FastAPI, HTTPException, Depends, Query, Response, Header
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -13,6 +13,17 @@ from security import load_keys_from_env, kid_from_pub, sign_token, verify_token
 # ================== Config ==================
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "change-me")
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./data.db")  # Render sẽ override bằng Postgres
+
+# --- helper sinh key ngắn gọn, dạng TKT-XXXX-XXXX-XXXX ---
+def generate_short_key(prefix: str = "TKT", blocks: int = 4, block_size: int = 4) -> str:
+    """
+    Sinh key ngắn gọn dùng Base32 chuẩn (A-Z, 2-7), bỏ dấu '='.
+    10 bytes -> 16 ký tự base32 => đủ 4 block x 4
+    Ví dụ: TKT-ABCD-EFGH-JKLM
+    """
+    raw = base64.b32encode(os.urandom(10)).decode().rstrip("=")  # 16 ký tự
+    key_body = "-".join(raw[i:i+block_size] for i in range(0, blocks * block_size, block_size))
+    return f"{prefix}-{key_body}"
 
 # ================== DB ==================
 engine = create_engine(DATABASE_URL, echo=False, pool_pre_ping=True)
@@ -150,10 +161,11 @@ def favicon():
 
 # ====== Schemas ======
 class LicenseCreate(BaseModel):
-    key: str
+    key: Optional[str] = None
     plan: Optional[str] = None
     max_devices: int = 1
     expires_days: Optional[int] = 365
+    notes: Optional[str] = None
 
 class LicenseUpdate(BaseModel):
     status: Optional[str] = None
@@ -178,11 +190,26 @@ class DeactivateIn(BaseModel):
 # ====== Admin CRUD ======
 @app.post("/licenses", dependencies=[Depends(admin_auth)])
 def create_license(data: LicenseCreate, db: Session = Depends(get_session)):
-    if db.exec(select(License).where(License.key == data.key)).first():
-        raise HTTPException(400, "Key exists")
-    lic = License(key=data.key, plan=data.plan, max_devices=data.max_devices)
+    # tạo hoặc dùng key được gửi vào
+    key = data.key or generate_short_key()
+
+    # tránh trùng: nếu trùng thì sinh lại (vòng lặp tối đa vài lần là đủ)
+    tries = 0
+    while db.exec(select(License).where(License.key == key)).first():
+        tries += 1
+        if tries > 5:
+            raise HTTPException(500, "Cannot generate unique key")
+        key = generate_short_key()
+
+    lic = License(
+        key=key,
+        plan=data.plan,
+        max_devices=data.max_devices,
+        notes=data.notes
+    )
     if data.expires_days:
         lic.expires_at = datetime.datetime.utcnow() + datetime.timedelta(days=data.expires_days)
+
     db.add(lic); db.commit(); db.refresh(lic)
     return {"id": lic.id, "key": lic.key}
 
