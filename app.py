@@ -1,40 +1,39 @@
-import os, time, datetime, base64
+# app.py
+import os
+import time
+import base64
+import datetime as dt
 from typing import Optional, List
+
 from fastapi import FastAPI, HTTPException, Depends, Query, Response, Header
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import HTMLResponse, FileResponse
-from sqlmodel import SQLModel, Field, Session, create_engine, select
-from sqladmin import Admin, ModelView
 from starlette.middleware.base import BaseHTTPMiddleware
-from sqlalchemy.exc import IntegrityError
-from sqlalchemy import UniqueConstraint, CheckConstraint, Column, String, Text, Index
-import datetime as dt
+
 from pydantic import BaseModel, Field as PydField
-from security import load_keys_from_env, kid_from_pub, sign_token, verify_token
+
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy import UniqueConstraint, CheckConstraint, Column, Text, Index
 from sqlalchemy.sql import func
 from sqlalchemy.types import DateTime
 
+from sqlmodel import SQLModel, Field, Session, create_engine, select
+from sqladmin import Admin, ModelView
+
+from security import load_keys_from_env, kid_from_pub, sign_token, verify_token
+
 # ================== Config ==================
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "change-me")
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./data.db")  # Render sẽ override bằng Postgres
-
-# --- helper sinh key ngắn gọn, dạng TKT-XXXX-XXXX-XXXX ---
-def generate_short_key(prefix: str = "TKT", blocks: int = 4, block_size: int = 4) -> str:
-    """
-    Sinh key ngắn gọn dùng Base32 chuẩn (A-Z, 2-7), bỏ dấu '='.
-    10 bytes -> 16 ký tự base32 => đủ 4 block x 4
-    Ví dụ: TKT-ABCD-EFGH-JKLM
-    """
-    raw = base64.b32encode(os.urandom(10)).decode().rstrip("=")  # 16 ký tự
-    key_body = "-".join(raw[i:i+block_size] for i in range(0, blocks * block_size, block_size))
-    return f"{prefix}-{key_body}"
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./data.db")
 
 # ================== DB ==================
 engine = create_engine(DATABASE_URL, echo=False, pool_pre_ping=True)
+
 def get_session():
     with Session(engine) as s:
         yield s
 
+# ================== Models ==================
 class License(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     key: str = Field(index=True, unique=True, nullable=False, max_length=64)
@@ -65,13 +64,12 @@ class Activation(SQLModel, table=True):
     hwid: str = Field(max_length=255)
     created_at: dt.datetime = Field(
         sa_column=Column(DateTime(timezone=False), server_default=func.now(), nullable=False)
-        # ❌ bỏ index=True ở đây
     )
     last_seen_at: Optional[dt.datetime] = Field(default=None)
 
     __table_args__ = (
         UniqueConstraint("license_key", "hwid", name="uq_activation_license_hwid"),
-        Index("ix_activation_created_at", "created_at"),  # ✅ tạo index ở đây
+        Index("ix_activation_created_at", "created_at"),
     )
 
 # ================== Auth ==================
@@ -91,6 +89,63 @@ def admin_auth(
 PRIV = None
 PUB_PEM = None
 KID = None
+
+# ================== Helpers ==================
+def now_utc() -> dt.datetime:
+    return dt.datetime.utcnow()
+
+# --- short key: TKT-XXXX-XXXX-XXXX ---
+def generate_short_key(prefix: str = "TKT", blocks: int = 4, block_size: int = 4) -> str:
+    """
+    Base32 (A-Z, 2-7), bỏ '='. 10 bytes -> 16 ký tự base32 => 4 block x 4
+    Ví dụ: TKT-ABCD-EFGH-JKLM
+    """
+    raw = base64.b32encode(os.urandom(10)).decode().rstrip("=")
+    key_body = "-".join(raw[i:i+block_size] for i in range(0, blocks * block_size, block_size))
+    return f"{prefix}-{key_body}"
+
+def _parse_semver(s: Optional[str]) -> tuple[int, int, int]:
+    if not s:
+        return (0, 0, 0)
+    parts = (s or "").strip().split(".")
+    out: List[int] = []
+    for i in range(3):
+        try:
+            out.append(int(parts[i]) if i < len(parts) and parts[i] != "" else 0)
+        except Exception:
+            out.append(0)
+    return tuple(out)  # type: ignore[return-value]
+
+def _version_lte(a: Optional[str], b: Optional[str]) -> bool:
+    """a <= b theo semver đơn giản x.y.z."""
+    return _parse_semver(a) <= _parse_semver(b)
+
+def _public_license_dict(lic: License, db: Session, app_ver: Optional[str] = None) -> dict:
+    expired = bool(lic.expires_at and lic.expires_at < now_utc())
+
+    # Đếm thiết bị đang kích hoạt
+    used_devices = db.exec(
+        select(Activation).where(Activation.license_key == lic.key)
+    ).unique().all()
+    used_devices_count = len(used_devices)
+
+    resp = {
+        "key": lic.key,
+        "status": lic.status,
+        "plan": lic.plan,
+        "max_devices": lic.max_devices,
+        "used_devices": used_devices_count,
+        "max_version": lic.max_version,
+        "expires_at": lic.expires_at.isoformat() + "Z" if lic.expires_at else None,
+        "license": lic.license,
+        "kid": KID,
+        "now": int(time.time()),
+        "expired": expired,
+    }
+    if app_ver is not None and lic.max_version:
+        resp["app_ver"] = app_ver
+        resp["app_allowed"] = _version_lte(app_ver, lic.max_version)
+    return resp
 
 # ================== App ==================
 BOOT_TS = time.time()
@@ -137,6 +192,7 @@ admin.add_view(LicenseAdmin)
 admin.add_view(ActivationAdmin)
 # -------------------------------------------
 
+# ================== Lifecycle & Static ==================
 @app.on_event("startup")
 def startup():
     global PRIV, PUB_PEM, KID
@@ -163,6 +219,7 @@ def index():
 <html><head><meta charset="utf-8"><title>TKT FastAPI</title></head>
 <body style="font-family:system-ui; max-width:720px; margin:40px auto; line-height:1.6">
   <h1>✅ TKT FastAPI is live</h1>
+  <h4>When you die, you can't see sunsets. </h4>
   <p>Uptime: <b>{uptime}s</b></p>
   <p>Active KID: <code>{KID}</code></p>
   <ul>
@@ -184,13 +241,13 @@ def favicon():
         return FileResponse(path, media_type="image/x-icon")
     return Response(status_code=204)
 
-# ====== Schemas ======
+# ================== Schemas ==================
 class LicenseCreate(BaseModel):
     key: Optional[str] = None
-    license: Optional[str] = None              # <-- thêm
+    license: Optional[str] = None
     plan: Optional[str] = None
     max_devices: int = PydField(default=1, ge=1)
-    max_version: Optional[str] = None          # <-- thêm (dạng "1.0.1")
+    max_version: Optional[str] = None
     expires_days: Optional[int] = PydField(default=365, ge=1)
     notes: Optional[str] = None
 
@@ -214,15 +271,19 @@ class DeactivateIn(BaseModel):
     key: str
     hwid: str
 
-# ====== Admin CRUD ======
-ALLOWED_PLANS = {"Free", "Basic", "Pro", "Enterprise"}  # đồng bộ với client
+class LicenseLookupIn(BaseModel):
+    key: str
+    app_ver: Optional[str] = None
+
+# ================== Admin CRUD ==================
+ALLOWED_PLANS = {"Free", "Plus", "Pro"}
+
 @app.post("/licenses", dependencies=[Depends(admin_auth)])
 def create_license(data: LicenseCreate, db: Session = Depends(get_session)):
-    # ----- Validate cơ bản -----
     if data.plan and data.plan not in ALLOWED_PLANS:
         raise HTTPException(status_code=422, detail=f"plan phải thuộc {sorted(ALLOWED_PLANS)}")
 
-    # ----- Tạo hoặc dùng key gửi lên -----
+    # sinh hoặc dùng key truyền lên
     key = data.key or generate_short_key()
     tries = 0
     while db.exec(select(License).where(License.key == key)).first():
@@ -231,32 +292,26 @@ def create_license(data: LicenseCreate, db: Session = Depends(get_session)):
             raise HTTPException(500, "Cannot generate unique key")
         key = generate_short_key()
 
-    # ----- Khởi tạo bản ghi: chỉ gán field nếu có dữ liệu -----
     lic = License(key=key)
 
     if data.license is not None:
         lic.license = data.license
-
     if data.plan is not None:
         lic.plan = data.plan
-
     if data.max_devices is not None:
         lic.max_devices = data.max_devices
-
     if data.max_version is not None:
-        lic.max_version = data.max_version   # nếu không gửi, giữ default "0.0.1" của model
-
+        lic.max_version = data.max_version
     if data.notes is not None:
         lic.notes = data.notes
-
     if data.expires_days:
-        lic.expires_at = dt.datetime.utcnow() + dt.timedelta(days=data.expires_days)
+        lic.expires_at = now_utc() + dt.timedelta(days=data.expires_days)
 
     try:
         db.add(lic)
         db.commit()
         db.refresh(lic)
-    except IntegrityError as e:
+    except IntegrityError:
         db.rollback()
         raise HTTPException(status_code=409, detail="Key đã tồn tại hoặc dữ liệu không hợp lệ")
     except Exception as e:
@@ -282,7 +337,6 @@ def list_licenses(q: Optional[str] = None, db: Session = Depends(get_session)):
         stmt = stmt.where(License.key.contains(q))
     return db.exec(stmt.order_by(License.created_at.desc())).all()
 
-# NEW: xem chi tiết 1 license + các activation
 @app.get("/licenses/{key}", dependencies=[Depends(admin_auth)])
 def get_license_detail(key: str, db: Session = Depends(get_session)):
     lic = db.exec(select(License).where(License.key == key)).first()
@@ -298,12 +352,14 @@ def update_license(key: str, data: LicenseUpdate, db: Session = Depends(get_sess
     lic = db.exec(select(License).where(License.key == key)).first()
     if not lic:
         raise HTTPException(404, "Not found")
+
     for k, v in data.model_dump(exclude_unset=True).items():
         if k == "expires_days" and v is not None:
-            lic.expires_at = datetime.datetime.utcnow() + datetime.timedelta(days=v)
+            lic.expires_at = now_utc() + dt.timedelta(days=v)
         elif k != "expires_days":
             setattr(lic, k, v)
-    lic.updated_at = datetime.datetime.utcnow()
+
+    lic.updated_at = now_utc()
     db.add(lic); db.commit(); db.refresh(lic)
     return {"ok": True}
 
@@ -325,7 +381,6 @@ def revoke(key: str, db: Session = Depends(get_session)):
     db.add(lic); db.commit()
     return {"ok": True}
 
-# NEW: liệt kê activations (có thể lọc theo key)
 @app.get("/activations", dependencies=[Depends(admin_auth)])
 def list_activations(key: Optional[str] = Query(None), db: Session = Depends(get_session)):
     stmt = select(Activation)
@@ -333,13 +388,13 @@ def list_activations(key: Optional[str] = Query(None), db: Session = Depends(get
         stmt = stmt.where(Activation.license_key == key)
     return db.exec(stmt.order_by(Activation.created_at.desc())).all()
 
-# ====== Activate / Validate / Deactivate ======
+# ================== Public: Activate / Validate / Deactivate ==================
 @app.post("/activate")
 def activate(data: ActivateIn, db: Session = Depends(get_session)):
     lic = db.exec(select(License).where(License.key == data.key)).first()
     if not lic or lic.status != "active":
         raise HTTPException(403, "License invalid")
-    if lic.expires_at and lic.expires_at < datetime.datetime.utcnow():
+    if lic.expires_at and lic.expires_at < now_utc():
         raise HTTPException(403, "License expired")
 
     actives: List[Activation] = db.exec(select(Activation).where(Activation.license_key == lic.key)).all()
@@ -350,7 +405,7 @@ def activate(data: ActivateIn, db: Session = Depends(get_session)):
         db.commit()
 
     # Token TTL 24h để revoke nhanh
-    exp = int(time.time()) + 24*3600
+    exp = int(time.time()) + 24 * 3600
     payload = {"k": lic.key, "e": exp, "m": lic.max_devices, "p": lic.plan or "", "kid": KID}
     token = sign_token(PRIV, payload)
     return {"token": token, "exp": exp, "kid": KID, "plan": lic.plan, "max_devices": lic.max_devices}
@@ -371,7 +426,8 @@ def validate_token(data: ValidateIn, db: Session = Depends(get_session)):
     ).first()
     if not act:
         raise HTTPException(403, "Device not activated")
-    act.last_seen_at = datetime.datetime.utcnow()
+
+    act.last_seen_at = now_utc()
     db.add(act); db.commit()
 
     return {"ok": True, "plan": lic.plan, "max_devices": lic.max_devices, "kid": payload.get("kid")}
@@ -385,3 +441,21 @@ def deactivate(data: DeactivateIn, db: Session = Depends(get_session)):
         raise HTTPException(404, "Activation not found")
     db.delete(act); db.commit()
     return {"ok": True}
+
+@app.post("/license/lookup")
+def license_lookup(data: LicenseLookupIn, db: Session = Depends(get_session)):
+    lic = db.exec(select(License).where(License.key == data.key)).first()
+    if not lic:
+        raise HTTPException(404, "Not found")
+    if lic.status != "active":
+        raise HTTPException(403, "License invalid")
+    return _public_license_dict(lic, db, data.app_ver)
+
+@app.get("/licenses/{key}/public")
+def get_license_public(key: str, app_ver: Optional[str] = None, db: Session = Depends(get_session)):
+    lic = db.exec(select(License).where(License.key == key)).first()
+    if not lic:
+        raise HTTPException(404, "Not found")
+    if lic.status != "active":
+        raise HTTPException(403, "License invalid")
+    return _public_license_dict(lic, db, app_ver)
