@@ -3,10 +3,12 @@ from typing import Optional, List
 from fastapi import FastAPI, HTTPException, Depends, Query, Response, Header
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.responses import HTMLResponse, FileResponse
-from pydantic import BaseModel
 from sqlmodel import SQLModel, Field, Session, create_engine, select
 from sqladmin import Admin, ModelView
 from starlette.middleware.base import BaseHTTPMiddleware
+from sqlalchemy.exc import IntegrityError
+import datetime as dt
+from pydantic import BaseModel, Field as PydField
 
 from security import load_keys_from_env, kid_from_pub, sign_token, verify_token
 
@@ -162,16 +164,18 @@ def favicon():
 # ====== Schemas ======
 class LicenseCreate(BaseModel):
     key: Optional[str] = None
+    license: Optional[str] = None              # <-- thêm
     plan: Optional[str] = None
-    max_devices: int = 1
-    expires_days: Optional[int] = 365
+    max_devices: int = PydField(default=1, ge=1)
+    max_version: Optional[str] = None          # <-- thêm (dạng "1.0.1")
+    expires_days: Optional[int] = PydField(default=365, ge=1)
     notes: Optional[str] = None
 
 class LicenseUpdate(BaseModel):
     status: Optional[str] = None
     plan: Optional[str] = None
-    max_devices: Optional[int] = None
-    expires_days: Optional[int] = None
+    max_devices: Optional[int] = PydField(default=None, ge=1)
+    expires_days: Optional[int] = PydField(default=None, ge=1)
     notes: Optional[str] = None
 
 class ActivateIn(BaseModel):
@@ -188,12 +192,15 @@ class DeactivateIn(BaseModel):
     hwid: str
 
 # ====== Admin CRUD ======
+ALLOWED_PLANS = {"Free", "Basic", "Pro", "Enterprise"}  # đồng bộ với client
 @app.post("/licenses", dependencies=[Depends(admin_auth)])
 def create_license(data: LicenseCreate, db: Session = Depends(get_session)):
-    # tạo hoặc dùng key được gửi vào
-    key = data.key or generate_short_key()
+    # ----- Validate cơ bản -----
+    if data.plan and data.plan not in ALLOWED_PLANS:
+        raise HTTPException(status_code=422, detail=f"plan phải thuộc {sorted(ALLOWED_PLANS)}")
 
-    # tránh trùng: nếu trùng thì sinh lại (vòng lặp tối đa vài lần là đủ)
+    # ----- Tạo hoặc dùng key gửi lên -----
+    key = data.key or generate_short_key()
     tries = 0
     while db.exec(select(License).where(License.key == key)).first():
         tries += 1
@@ -201,17 +208,49 @@ def create_license(data: LicenseCreate, db: Session = Depends(get_session)):
             raise HTTPException(500, "Cannot generate unique key")
         key = generate_short_key()
 
-    lic = License(
-        key=key,
-        plan=data.plan,
-        max_devices=data.max_devices,
-        notes=data.notes
-    )
-    if data.expires_days:
-        lic.expires_at = datetime.datetime.utcnow() + datetime.timedelta(days=data.expires_days)
+    # ----- Khởi tạo bản ghi: chỉ gán field nếu có dữ liệu -----
+    lic = License(key=key)
 
-    db.add(lic); db.commit(); db.refresh(lic)
-    return {"id": lic.id, "key": lic.key}
+    if data.license is not None:
+        lic.license = data.license
+
+    if data.plan is not None:
+        lic.plan = data.plan
+
+    if data.max_devices is not None:
+        lic.max_devices = data.max_devices
+
+    if data.max_version is not None:
+        lic.max_version = data.max_version   # nếu không gửi, giữ default "0.0.1" của model
+
+    if data.notes is not None:
+        lic.notes = data.notes
+
+    if data.expires_days:
+        lic.expires_at = dt.datetime.utcnow() + dt.timedelta(days=data.expires_days)
+
+    try:
+        db.add(lic)
+        db.commit()
+        db.refresh(lic)
+    except IntegrityError as e:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Key đã tồn tại hoặc dữ liệu không hợp lệ")
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Lỗi lưu DB: {e}")
+
+    return {
+        "id": lic.id,
+        "key": lic.key,
+        "license": lic.license,
+        "plan": lic.plan,
+        "max_devices": lic.max_devices,
+        "max_version": lic.max_version,
+        "expires_at": lic.expires_at.isoformat() + "Z" if lic.expires_at else None,
+        "notes": lic.notes,
+        "created_at": lic.created_at.isoformat() + "Z" if getattr(lic, "created_at", None) else None,
+    }
 
 @app.get("/licenses", dependencies=[Depends(admin_auth)])
 def list_licenses(q: Optional[str] = None, db: Session = Depends(get_session)):
