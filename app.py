@@ -6,11 +6,12 @@ from fastapi.responses import HTMLResponse, FileResponse
 from sqlmodel import SQLModel, Field, Session, create_engine, select
 from sqladmin import Admin, ModelView
 from starlette.middleware.base import BaseHTTPMiddleware
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, UniqueConstraint, CheckConstraint, Column, String, Text
 import datetime as dt
 from pydantic import BaseModel, Field as PydField
-
 from security import load_keys_from_env, kid_from_pub, sign_token, verify_token
+from sqlalchemy.sql import func
+from sqlalchemy.types import DateTime
 
 # ================== Config ==================
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "change-me")
@@ -35,21 +36,37 @@ def get_session():
 
 class License(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
-    key: str = Field(index=True, unique=True, nullable=False)
-    status: str = Field(default="active")  # active|revoked|deleted
-    plan: Optional[str] = None
-    max_devices: int = 1
-    expires_at: Optional[datetime.datetime] = None
-    notes: Optional[str] = None
-    created_at: datetime.datetime = Field(default_factory=datetime.datetime.utcnow)
-    updated_at: datetime.datetime = Field(default_factory=datetime.datetime.utcnow)
-
+    key: str = Field(index=True, unique=True, nullable=False, max_length=64)
+    license: Optional[str] = Field(default=None, sa_column=Column(Text))
+    status: str = Field(default="active", max_length=16)
+    plan: Optional[str] = Field(default=None, max_length=32)
+    max_version: str = Field(default="0.0.1", max_length=50)
+    max_devices: int = Field(default=1)
+    expires_at: Optional[dt.datetime] = Field(default=None)
+    notes: Optional[str] = Field(default=None)
+    created_at: dt.datetime = Field(
+        sa_column=Column(DateTime(timezone=False), server_default=func.now(), nullable=False),
+        index=True
+    )
+    updated_at: dt.datetime = Field(
+        sa_column=Column(DateTime(timezone=False), server_default=func.now(), onupdate=func.now(), nullable=False),
+        index=True
+    )
+    __table_args__ = (
+        CheckConstraint("status in ('active','revoked','deleted')", name="ck_license_status"),
+    )
 class Activation(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
-    license_key: str = Field(index=True)
-    hwid: str
-    created_at: datetime.datetime = Field(default_factory=datetime.datetime.utcnow)
-    last_seen_at: Optional[datetime.datetime] = None
+    license_key: str = Field(index=True, max_length=64)
+    hwid: str = Field(max_length=255)
+    created_at: dt.datetime = Field(
+        sa_column=Column(DateTime(timezone=False), server_default=func.now(), nullable=False),
+        index=True
+    )
+    last_seen_at: Optional[dt.datetime] = Field(default=None)
+    __table_args__ = (
+        UniqueConstraint("license_key", "hwid", name="uq_activation_license_hwid"),
+    )
 
 # ================== Auth ==================
 bearer = HTTPBearer(auto_error=False)

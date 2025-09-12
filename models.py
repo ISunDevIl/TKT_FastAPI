@@ -1,4 +1,3 @@
-# models.py (hoặc đặt ngay trong app.py)
 from typing import Optional
 from sqlmodel import SQLModel, Field
 from sqlalchemy import UniqueConstraint, CheckConstraint
