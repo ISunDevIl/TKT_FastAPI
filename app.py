@@ -13,7 +13,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from pydantic import BaseModel, Field as PydField
 
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy import UniqueConstraint, CheckConstraint, Column, Text, Index
+from sqlalchemy import UniqueConstraint, CheckConstraint, Column, Text, Index, and_, or_
 from sqlalchemy.sql import func
 from sqlalchemy.types import DateTime
 
@@ -275,6 +275,25 @@ class LicenseLookupIn(BaseModel):
     key: str
     app_ver: Optional[str] = None
 
+class LicenseItem(BaseModel):
+    id: int
+    key: str
+    status: str
+    plan: Optional[str] = None
+    max_devices: int
+    used_devices: int
+    max_version: Optional[str] = None
+    expires_at: Optional[str] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+class LicenseListResponse(BaseModel):
+    items: List[LicenseItem]
+    total: int
+    page: int
+    page_size: int
+    pages: int
+
 # ================== Admin CRUD ==================
 ALLOWED_PLANS = {"Free", "Plus", "Pro"}
 
@@ -330,12 +349,112 @@ def create_license(data: LicenseCreate, db: Session = Depends(get_session)):
         "created_at": lic.created_at.isoformat() + "Z" if getattr(lic, "created_at", None) else None,
     }
 
-@app.get("/licenses", dependencies=[Depends(admin_auth)])
-def list_licenses(q: Optional[str] = None, db: Session = Depends(get_session)):
-    stmt = select(License)
+@app.get("/licenses", response_model=LicenseListResponse, dependencies=[Depends(admin_auth)])
+def list_licenses(
+    db: Session = Depends(get_session),
+    # Tìm kiếm & lọc
+    q: Optional[str] = Query(None, description="Tìm theo key/plan/status (substring)"),
+    status: Optional[str] = Query(None, description="Lọc theo trạng thái: active/revoked/deleted"),
+    plan: Optional[str] = Query(None, description="Lọc theo gói: Free/Plus/Pro"),
+    created_from: Optional[dt.datetime] = Query(None),
+    created_to: Optional[dt.datetime] = Query(None),
+    expires_from: Optional[dt.datetime] = Query(None),
+    expires_to: Optional[dt.datetime] = Query(None),
+    # Phân trang
+    page: int = Query(1, ge=1),
+    page_size: int = Query(20, ge=1, le=200),
+    # Sắp xếp
+    sort_by: str = Query("created_at", pattern="^(created_at|updated_at|expires_at|key)$"),
+    sort_dir: str = Query("desc", pattern="^(asc|desc)$"),
+):
+    def _iso(x: Optional[dt.datetime]) -> Optional[str]:
+        if not x:
+            return None
+        # Chuẩn hóa ISO dạng UTC naive + 'Z' (đồng bộ với các field khác của bạn)
+        return x.isoformat() + "Z"
+
+    # ----- Build bộ lọc -----
+    filters = []
     if q:
-        stmt = stmt.where(License.key.contains(q))
-    return db.exec(stmt.order_by(License.created_at.desc())).all()
+        like = f"%{q}%"
+        filters.append(or_(License.key.ilike(like), License.plan.ilike(like), License.status.ilike(like)))
+    if status:
+        filters.append(License.status == status)
+    if plan:
+        filters.append(License.plan == plan)
+    if created_from:
+        filters.append(License.created_at >= created_from)
+    if created_to:
+        filters.append(License.created_at <= created_to)
+    if expires_from:
+        filters.append(License.expires_at != None)  # tránh so sánh NULL
+        filters.append(License.expires_at >= expires_from)
+    if expires_to:
+        filters.append(License.expires_at != None)
+        filters.append(License.expires_at <= expires_to)
+
+    where_clause = and_(*filters) if filters else None
+
+    # ----- Tổng số bản ghi -----
+    count_stmt = select(func.count()).select_from(License)
+    if where_clause is not None:
+        count_stmt = count_stmt.where(where_clause)
+    total = db.exec(count_stmt).one()
+    if isinstance(total, tuple):  # phòng khi driver trả về tuple
+        total = total[0]
+    total = int(total)
+
+    # ----- Sắp xếp -----
+    sort_map = {
+        "created_at": License.created_at,
+        "updated_at": License.updated_at,
+        "expires_at": License.expires_at,
+        "key": License.key,
+    }
+    order_col = sort_map.get(sort_by, License.created_at)
+    order_by = order_col.desc() if sort_dir == "desc" else order_col.asc()
+
+    # ----- Lấy dữ liệu theo trang -----
+    offset = (page - 1) * page_size
+    stmt = select(License).order_by(order_by).offset(offset).limit(page_size)
+    if where_clause is not None:
+        stmt = stmt.where(where_clause)
+
+    licenses: List[License] = db.exec(stmt).all()
+
+    # ----- Tính used_devices cho tất cả key trong 1 query -----
+    if licenses:
+        keys = [lic.key for lic in licenses]
+        cnt_stmt = (
+            select(Activation.license_key, func.count(Activation.id))
+            .where(Activation.license_key.in_(keys))
+            .group_by(Activation.license_key)
+        )
+        counts = dict(db.exec(cnt_stmt).all())
+    else:
+        counts = {}
+
+    # ----- Map ra response items -----
+    items: List[LicenseItem] = []
+    for lic in licenses:
+        items.append(
+            LicenseItem(
+                id=lic.id,
+                key=lic.key,
+                status=lic.status,
+                plan=lic.plan,
+                max_devices=lic.max_devices,
+                used_devices=int(counts.get(lic.key, 0)),
+                max_version=lic.max_version,
+                expires_at=_iso(lic.expires_at),
+                created_at=_iso(getattr(lic, "created_at", None)),
+                updated_at=_iso(getattr(lic, "updated_at", None)),
+            )
+        )
+
+    pages = (total + page_size - 1) // page_size
+    return {"items": items, "total": total, "page": page, "page_size": page_size, "pages": pages}
+
 
 @app.get("/licenses/{key}", dependencies=[Depends(admin_auth)])
 def get_license_detail(key: str, db: Session = Depends(get_session)):
