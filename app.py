@@ -7,7 +7,7 @@ from sqlmodel import SQLModel, Field, Session, create_engine, select
 from sqladmin import Admin, ModelView
 from starlette.middleware.base import BaseHTTPMiddleware
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy import UniqueConstraint, CheckConstraint, Column, String, Text
+from sqlalchemy import UniqueConstraint, CheckConstraint, Column, String, Text, Index
 import datetime as dt
 from pydantic import BaseModel, Field as PydField
 from security import load_keys_from_env, kid_from_pub, sign_token, verify_token
@@ -46,15 +46,16 @@ class License(SQLModel, table=True):
     expires_at: Optional[dt.datetime] = Field(default=None)
     notes: Optional[str] = Field(default=None)
     created_at: dt.datetime = Field(
-        sa_column=Column(DateTime(timezone=False), server_default=func.now(), nullable=False),
-        index=True
+        sa_column=Column(DateTime(), server_default=func.now(), nullable=False)
     )
     updated_at: dt.datetime = Field(
-        sa_column=Column(DateTime(timezone=False), server_default=func.now(), onupdate=func.now(), nullable=False),
-        index=True
+        sa_column=Column(DateTime(), server_default=func.now(), onupdate=func.now(), nullable=False)
     )
+
     __table_args__ = (
-        CheckConstraint("status in ('active','revoked','deleted')", name="ck_license_status"),
+    CheckConstraint("status in ('active','revoked','deleted')", name="ck_license_status"),
+    Index("ix_license_created_at", "created_at"),
+    Index("ix_license_updated_at", "updated_at"),
     )
 class Activation(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
