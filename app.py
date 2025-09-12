@@ -6,7 +6,8 @@ from fastapi.responses import HTMLResponse, FileResponse
 from sqlmodel import SQLModel, Field, Session, create_engine, select
 from sqladmin import Admin, ModelView
 from starlette.middleware.base import BaseHTTPMiddleware
-from sqlalchemy.exc import IntegrityError, UniqueConstraint, CheckConstraint, Column, String, Text
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy import UniqueConstraint, CheckConstraint, Column, String, Text
 import datetime as dt
 from pydantic import BaseModel, Field as PydField
 from security import load_keys_from_env, kid_from_pub, sign_token, verify_token
