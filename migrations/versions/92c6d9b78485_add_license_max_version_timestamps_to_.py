@@ -72,7 +72,16 @@ def upgrade() -> None:
 
     # (Tuỳ chọn) Bỏ server_default của max_version nếu muốn chỉ giữ default ở tầng app
     # op.alter_column("license", "max_version", server_default=None)
-
+    op.execute(
+        "ALTER TABLE `license` "
+        "MODIFY `created_at` DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP"
+    )
+    # updated_at: default + on update
+    op.execute(
+        "ALTER TABLE `license` "
+        "MODIFY `updated_at` DATETIME NOT NULL "
+        "DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP"
+    )
 
 def downgrade() -> None:
     """Downgrade schema."""
