@@ -53,21 +53,25 @@ class License(SQLModel, table=True):
     )
 
     __table_args__ = (
-    CheckConstraint("status in ('active','revoked','deleted')", name="ck_license_status"),
-    Index("ix_license_created_at", "created_at"),
-    Index("ix_license_updated_at", "updated_at"),
+        CheckConstraint("status in ('active','revoked','deleted')", name="ck_license_status"),
+        Index("ix_license_created_at", "created_at"),
+        Index("ix_license_updated_at", "updated_at"),
     )
+
+
 class Activation(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     license_key: str = Field(index=True, max_length=64)
     hwid: str = Field(max_length=255)
     created_at: dt.datetime = Field(
-        sa_column=Column(DateTime(timezone=False), server_default=func.now(), nullable=False),
-        index=True
+        sa_column=Column(DateTime(timezone=False), server_default=func.now(), nullable=False)
+        # ❌ bỏ index=True ở đây
     )
     last_seen_at: Optional[dt.datetime] = Field(default=None)
+
     __table_args__ = (
         UniqueConstraint("license_key", "hwid", name="uq_activation_license_hwid"),
+        Index("ix_activation_created_at", "created_at"),  # ✅ tạo index ở đây
     )
 
 # ================== Auth ==================

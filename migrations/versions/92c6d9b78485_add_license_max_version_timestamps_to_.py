@@ -68,6 +68,7 @@ def upgrade() -> None:
     # 4) Tạo index cho created_at và updated_at
     op.create_index("ix_license_created_at", "license", ["created_at"], unique=False)
     op.create_index("ix_license_updated_at", "license", ["updated_at"], unique=False)
+    op.create_index("ix_activation_created_at", "activation", ["created_at"], unique=False)
 
     # (Tuỳ chọn) Bỏ server_default của max_version nếu muốn chỉ giữ default ở tầng app
     # op.alter_column("license", "max_version", server_default=None)
