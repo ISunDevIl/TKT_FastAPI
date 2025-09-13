@@ -137,14 +137,7 @@ def _version_lte(a: Optional[str], b: Optional[str]) -> bool:
 def _public_license_dict(lic: License, db: Session, app_ver: Optional[str] = None) -> dict:
     expired = bool(lic.expires_at and lic.expires_at < now_utc())
 
-    # Đếm thiết bị từ bảng device (đúng với seats)
-    used_devices_count = db.exec(
-        select(func.count(Device.id)).where(Device.license_id == lic.id)
-    ).one()
-    # một số driver trả tuple
-    if isinstance(used_devices_count, tuple):
-        used_devices_count = used_devices_count[0]
-    used_devices_count = int(used_devices_count)
+    used_devices_count = scalar_int(db, select(func.count(Device.id)).where(Device.license_id == lic.id))
 
     resp = {
         "key": lic.key,
@@ -163,6 +156,18 @@ def _public_license_dict(lic: License, db: Session, app_ver: Optional[str] = Non
         resp["app_ver"] = app_ver
         resp["app_allowed"] = _version_lte(app_ver, lic.max_version)
     return resp
+
+def scalar_int(db: Session, stmt) -> int:
+    """Lấy về 1 số nguyên từ SELECT COUNT(*) ... an toàn cho mọi driver."""
+    res = db.exec(stmt)
+    # SQLAlchemy 2.x / SQLModel mới có scalar_one()
+    if hasattr(res, "scalar_one"):
+        try:
+            return int(res.scalar_one() or 0)
+        except Exception:
+            pass
+    val = res.one()
+    return int((val[0] if isinstance(val, tuple) else val) or 0)
 
 # ================== App ==================
 BOOT_TS = time.time()
@@ -609,7 +614,7 @@ def register_device(data: DeviceRegisterIn, db: Session = Depends(get_session)):
     lic = db.exec(select(License).where(License.key == data.key)).first()
     if not lic or lic.status != "active":
         raise HTTPException(403, "License invalid")
-    if lic.expires_at and lic.expires_at < dt.datetime.utcnow():
+    if lic.expires_at and lic.expires_at < now_utc():
         raise HTTPException(403, "License expired")
 
     # Upsert theo (license_id, hwid)
@@ -619,9 +624,7 @@ def register_device(data: DeviceRegisterIn, db: Session = Depends(get_session)):
 
     if not dev:
         # kiểm tra seats
-        used = db.exec(
-            select(func.count(Device.id)).where(Device.license_id == lic.id)
-        ).one()[0]
+        used = scalar_int(db, select(func.count(Device.id)).where(Device.license_id == lic.id))
         if used >= lic.max_devices:
             raise HTTPException(403, f"Seats reached ({lic.max_devices})")
 
@@ -644,13 +647,11 @@ def register_device(data: DeviceRegisterIn, db: Session = Depends(get_session)):
             dev.platform = data.platform; changed = True
         if data.app_ver and data.app_ver != dev.app_ver:
             dev.app_ver = data.app_ver; changed = True
-        dev.last_seen_at = dt.datetime.utcnow(); changed = True
+        dev.last_seen_at = now_utc(); changed = True
         if changed:
             db.add(dev); db.commit(); db.refresh(dev)
 
-    used_after = db.exec(
-        select(func.count(Device.id)).where(Device.license_id == lic.id)
-    ).one()[0]
+    used_after = scalar_int(db, select(func.count(Device.id)).where(Device.license_id == lic.id))
 
     return {
         "ok": True,
