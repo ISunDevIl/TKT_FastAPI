@@ -57,6 +57,20 @@ class License(SQLModel, table=True):
         Index("ix_license_updated_at", "updated_at"),
     )
 
+class Device(SQLModel, table=True):
+    # Bảng quản lý máy sử dụng license
+    id: Optional[int] = Field(default=None, primary_key=True)
+    license_id: int = Field(index=True, foreign_key="license.id") # tham chiếu license
+    hwid: str = Field(index=True)                                 # mã phần cứng duy nhất
+    hostname: Optional[str] = None                                # tên máy (tuỳ chọn)
+    platform: Optional[str] = None                                # Windows/Linux/Mac...
+    app_ver: Optional[str] = None                                 # version app khi activate
+    created_at: dt.datetime = Field(default_factory=dt.datetime.utcnow, index=True)
+    last_seen_at: Optional[dt.datetime] = None
+
+    __table_args__ = (
+        UniqueConstraint("license_id", "hwid", name="uq_device_license_hwid"),
+    )
 
 class Activation(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
@@ -123,18 +137,21 @@ def _version_lte(a: Optional[str], b: Optional[str]) -> bool:
 def _public_license_dict(lic: License, db: Session, app_ver: Optional[str] = None) -> dict:
     expired = bool(lic.expires_at and lic.expires_at < now_utc())
 
-    # Đếm thiết bị đang kích hoạt
-    used_devices = db.exec(
-        select(Activation).where(Activation.license_key == lic.key)
-    ).unique().all()
-    used_devices_count = len(used_devices)
+    # Đếm thiết bị từ bảng device (đúng với seats)
+    used_devices_count = db.exec(
+        select(func.count(Device.id)).where(Device.license_id == lic.id)
+    ).one()
+    # một số driver trả tuple
+    if isinstance(used_devices_count, tuple):
+        used_devices_count = used_devices_count[0]
+    used_devices_count = int(used_devices_count)
 
     resp = {
         "key": lic.key,
         "status": lic.status,
         "plan": lic.plan,
         "max_devices": lic.max_devices,
-        "used_devices": used_devices_count,
+        "used_devices": used_devices_count,  # <-- đếm theo device
         "max_version": lic.max_version,
         "expires_at": lic.expires_at.isoformat() + "Z" if lic.expires_at else None,
         "license": lic.license,
@@ -294,6 +311,13 @@ class LicenseListResponse(BaseModel):
     page_size: int
     pages: int
 
+class DeviceRegisterIn(BaseModel):
+    key: str
+    hwid: str
+    hostname: Optional[str] = None
+    platform: Optional[str] = None
+    app_ver: Optional[str] = None
+
 # ================== Admin CRUD ==================
 ALLOWED_PLANS = {"Free", "Plus", "Pro"}
 
@@ -424,13 +448,13 @@ def list_licenses(
 
     # ----- Tính used_devices cho tất cả key trong 1 query -----
     if licenses:
-        keys = [lic.key for lic in licenses]
+        lic_ids = [lic.id for lic in licenses]
         cnt_stmt = (
-            select(Activation.license_key, func.count(Activation.id))
-            .where(Activation.license_key.in_(keys))
-            .group_by(Activation.license_key)
+            select(Device.license_id, func.count(Device.id))
+            .where(Device.license_id.in_(lic_ids))
+            .group_by(Device.license_id)
         )
-        counts = dict(db.exec(cnt_stmt).all())
+        counts = dict(db.exec(cnt_stmt).all())  # {license_id: count}
     else:
         counts = {}
 
@@ -443,7 +467,7 @@ def list_licenses(
                 key=lic.key,
                 status=lic.status,
                 plan=lic.plan,
-                max_devices=lic.max_devices,
+                max_devices=int(counts.get(lic.id, 0)),
                 used_devices=int(counts.get(lic.key, 0)),
                 max_version=lic.max_version,
                 expires_at=_iso(lic.expires_at),
@@ -578,3 +602,60 @@ def get_license_public(key: str, app_ver: Optional[str] = None, db: Session = De
     if lic.status != "active":
         raise HTTPException(403, "License invalid")
     return _public_license_dict(lic, db, app_ver)
+
+@app.post("/devices/register")
+def register_device(data: DeviceRegisterIn, db: Session = Depends(get_session)):
+    # Tìm license
+    lic = db.exec(select(License).where(License.key == data.key)).first()
+    if not lic or lic.status != "active":
+        raise HTTPException(403, "License invalid")
+    if lic.expires_at and lic.expires_at < dt.datetime.utcnow():
+        raise HTTPException(403, "License expired")
+
+    # Upsert theo (license_id, hwid)
+    dev = db.exec(
+        select(Device).where(Device.license_id == lic.id, Device.hwid == data.hwid)
+    ).first()
+
+    if not dev:
+        # kiểm tra seats
+        used = db.exec(
+            select(func.count(Device.id)).where(Device.license_id == lic.id)
+        ).one()[0]
+        if used >= lic.max_devices:
+            raise HTTPException(403, f"Seats reached ({lic.max_devices})")
+
+        dev = Device(
+            license_id=lic.id,
+            hwid=data.hwid,
+            hostname=data.hostname,
+            platform=data.platform,
+            app_ver=data.app_ver,
+        )
+        db.add(dev)
+        db.commit()
+        db.refresh(dev)
+    else:
+        # update thông tin + last_seen
+        changed = False
+        if data.hostname and data.hostname != dev.hostname:
+            dev.hostname = data.hostname; changed = True
+        if data.platform and data.platform != dev.platform:
+            dev.platform = data.platform; changed = True
+        if data.app_ver and data.app_ver != dev.app_ver:
+            dev.app_ver = data.app_ver; changed = True
+        dev.last_seen_at = dt.datetime.utcnow(); changed = True
+        if changed:
+            db.add(dev); db.commit(); db.refresh(dev)
+
+    used_after = db.exec(
+        select(func.count(Device.id)).where(Device.license_id == lic.id)
+    ).one()[0]
+
+    return {
+        "ok": True,
+        "license_key": lic.key,
+        "device_id": dev.id,
+        "used_devices": used_after,
+        "max_devices": lic.max_devices,
+    }

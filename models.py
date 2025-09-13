@@ -1,7 +1,8 @@
 from typing import Optional
-from sqlmodel import SQLModel, Field
+from sqlmodel import SQLModel, Field, Session, create_engine, select
 from sqlalchemy import UniqueConstraint, CheckConstraint
 import datetime
+from sqlalchemy import func
 
 class License(SQLModel, table=True):
     # Bảng license
