@@ -107,6 +107,12 @@ KID = None
 # ================== Helpers ==================
 def now_utc() -> dt.datetime:
     return dt.datetime.utcnow()
+def now_utc_minute() -> dt.datetime:
+    return dt.datetime.utcnow().replace(second=0, microsecond=0)
+def to_iso_z(t: Optional[dt.datetime]) -> Optional[str]:
+    if not t:
+        return None
+    return t.replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 # --- short key: TKT-XXXX-XXXX-XXXX ---
 def generate_short_key(prefix: str = "TKT", blocks: int = 4, block_size: int = 4) -> str:
@@ -144,9 +150,9 @@ def _public_license_dict(lic: License, db: Session, app_ver: Optional[str] = Non
         "status": lic.status,
         "plan": lic.plan,
         "max_devices": lic.max_devices,
-        "used_devices": used_devices_count,  # <-- đếm theo device
+        "used_devices": used_devices_count,
         "max_version": lic.max_version,
-        "expires_at": lic.expires_at.isoformat() + "Z" if lic.expires_at else None,
+        "expires_at": to_iso_z(lic.expires_at),
         "license": lic.license,
         "kid": KID,
         "now": int(time.time()),
@@ -353,7 +359,8 @@ def create_license(data: LicenseCreate, db: Session = Depends(get_session)):
     if data.notes is not None:
         lic.notes = data.notes
     if data.expires_days:
-        lic.expires_at = now_utc() + dt.timedelta(days=data.expires_days)
+        base = now_utc_minute()
+        lic.expires_at = base + dt.timedelta(days=data.expires_days)
 
     try:
         db.add(lic)
@@ -373,7 +380,7 @@ def create_license(data: LicenseCreate, db: Session = Depends(get_session)):
         "plan": lic.plan,
         "max_devices": lic.max_devices,
         "max_version": lic.max_version,
-        "expires_at": lic.expires_at.isoformat() + "Z" if lic.expires_at else None,
+        "expires_at": to_iso_z(lic.expires_at),
         "notes": lic.notes,
         "created_at": lic.created_at.isoformat() + "Z" if getattr(lic, "created_at", None) else None,
     }
@@ -472,8 +479,8 @@ def list_licenses(
                 key=lic.key,
                 status=lic.status,
                 plan=lic.plan,
-                max_devices=int(counts.get(lic.id, 0)),
-                used_devices=int(counts.get(lic.key, 0)),
+                max_devices=lic.max_devices,
+                used_devices=int(counts.get(lic.id, 0)),
                 max_version=lic.max_version,
                 expires_at=_iso(lic.expires_at),
                 created_at=_iso(getattr(lic, "created_at", None)),
@@ -503,7 +510,8 @@ def update_license(key: str, data: LicenseUpdate, db: Session = Depends(get_sess
 
     for k, v in data.model_dump(exclude_unset=True).items():
         if k == "expires_days" and v is not None:
-            lic.expires_at = now_utc() + dt.timedelta(days=v)
+            base = now_utc_minute()
+            lic.expires_at = base + dt.timedelta(days=v)
         elif k != "expires_days":
             setattr(lic, k, v)
 
