@@ -596,4 +596,80 @@ def deactivate(data: DeactivateIn, db: Session = Depends(get_session)):
     ).first()
     if not act:
         raise HTTPException(404, "Activation not found")
-    db.delete(act); db.com
+    db.delete(act); db.commit()
+    return {"ok": True}
+
+class LicenseLookupIn(BaseModel):
+    key: str
+    app_ver: Optional[str] = None
+
+@app.post("/license/lookup")
+def license_lookup(data: LicenseLookupIn, db: Session = Depends(get_session)):
+    lic = db.exec(select(License).where(License.key == data.key)).first()
+    if not lic:
+        raise HTTPException(404, "Not found")
+    if lic.status != "active":
+        raise HTTPException(403, "License invalid")
+    return _public_license_dict(lic, db, data.app_ver)
+
+@app.get("/licenses/{key}/public")
+def get_license_public(key: str, app_ver: Optional[str] = None, db: Session = Depends(get_session)):
+    lic = db.exec(select(License).where(License.key == key)).first()
+    if not lic:
+        raise HTTPException(404, "Not found")
+    if lic.status != "active":
+        raise HTTPException(403, "License invalid")
+    return _public_license_dict(lic, db, app_ver)
+
+@app.post("/devices/register")
+def register_device(data: DeviceRegisterIn, db: Session = Depends(get_session)):
+    # Tìm license
+    lic = db.exec(select(License).where(License.key == data.key)).first()
+    if not lic or lic.status != "active":
+        raise HTTPException(403, "License invalid")
+    if lic.expires_at and lic.expires_at < now_naive_utc():
+        raise HTTPException(403, "License expired")
+
+    # Upsert theo (license_id, hwid)
+    dev = db.exec(
+        select(Device).where(Device.license_id == lic.id, Device.hwid == data.hwid)
+    ).first()
+
+    if not dev:
+        # kiểm tra seats
+        used = scalar_int(db, select(func.count(Device.id)).where(Device.license_id == lic.id))
+        if used >= lic.max_devices:
+            raise HTTPException(403, f"Seats reached ({lic.max_devices})")
+
+        dev = Device(
+            license_id=lic.id,
+            hwid=data.hwid,
+            hostname=data.hostname,
+            platform=data.platform,
+            app_ver=data.app_ver,
+        )
+        db.add(dev)
+        db.commit()
+        db.refresh(dev)
+    else:
+        # update thông tin + last_seen
+        changed = False
+        if data.hostname and data.hostname != dev.hostname:
+            dev.hostname = data.hostname; changed = True
+        if data.platform and data.platform != dev.platform:
+            dev.platform = data.platform; changed = True
+        if data.app_ver and data.app_ver != dev.app_ver:
+            dev.app_ver = data.app_ver; changed = True
+        dev.last_seen_at = now_naive_utc(); changed = True
+        if changed:
+            db.add(dev); db.commit(); db.refresh(dev)
+
+    used_after = scalar_int(db, select(func.count(Device.id)).where(Device.license_id == lic.id))
+
+    return {
+        "ok": True,
+        "license_key": lic.key,
+        "device_id": dev.id,
+        "used_devices": used_after,
+        "max_devices": lic.max_devices,
+    }
