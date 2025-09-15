@@ -22,6 +22,25 @@ from sqladmin import Admin, ModelView
 
 from security import load_keys_from_env, kid_from_pub, sign_token, verify_token
 
+# ==== Thời gian: dùng tkt_time (kèm fallback) ====
+from datetime import timezone
+from utilities.tkt_time import utc_now, utc_now_floor_minute, to_iso_z
+
+def now_naive_utc() -> dt.datetime:
+    """UTC aware -> UTC naive (để lưu/so sánh trong DB)"""
+    return utc_now().replace(tzinfo=None)
+
+def now_naive_utc_minute() -> dt.datetime:
+    """UTC aware (floor minute) -> UTC naive"""
+    return utc_now_floor_minute().replace(tzinfo=None)
+
+def to_iso_z_naive(x: Optional[dt.datetime]) -> Optional[str]:
+    """Datetime naive (giả định UTC) -> ISO Z"""
+    if not x:
+        return None
+    return to_iso_z(x.replace(tzinfo=timezone.utc))
+
+
 # ================== Config ==================
 ADMIN_TOKEN = os.getenv("ADMIN_TOKEN", "change-me")
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./data.db")
@@ -60,12 +79,12 @@ class License(SQLModel, table=True):
 class Device(SQLModel, table=True):
     # Bảng quản lý máy sử dụng license
     id: Optional[int] = Field(default=None, primary_key=True)
-    license_id: int = Field(index=True, foreign_key="license.id") # tham chiếu license
-    hwid: str = Field(index=True)                                 # mã phần cứng duy nhất
-    hostname: Optional[str] = None                                # tên máy (tuỳ chọn)
-    platform: Optional[str] = None                                # Windows/Linux/Mac...
-    app_ver: Optional[str] = None                                 # version app khi activate
-    created_at: dt.datetime = Field(default_factory=dt.datetime.utcnow, index=True)
+    license_id: int = Field(index=True, foreign_key="license.id")
+    hwid: str = Field(index=True)
+    hostname: Optional[str] = None
+    platform: Optional[str] = None
+    app_ver: Optional[str] = None
+    created_at: dt.datetime = Field(default_factory=now_naive_utc, index=True)
     last_seen_at: Optional[dt.datetime] = None
 
     __table_args__ = (
@@ -105,25 +124,6 @@ PUB_PEM = None
 KID = None
 
 # ================== Helpers ==================
-def now_utc() -> dt.datetime:
-    return dt.datetime.utcnow()
-def now_utc_minute() -> dt.datetime:
-    return dt.datetime.utcnow().replace(second=0, microsecond=0)
-def to_iso_z(t: Optional[dt.datetime]) -> Optional[str]:
-    if not t:
-        return None
-    return t.replace(microsecond=0).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-# --- short key: TKT-XXXX-XXXX-XXXX ---
-def generate_short_key(prefix: str = "TKT", blocks: int = 4, block_size: int = 4) -> str:
-    """
-    Base32 (A-Z, 2-7), bỏ '='. 10 bytes -> 16 ký tự base32 => 4 block x 4
-    Ví dụ: TKT-ABCD-EFGH-JKLM
-    """
-    raw = base64.b32encode(os.urandom(10)).decode().rstrip("=")
-    key_body = "-".join(raw[i:i+block_size] for i in range(0, blocks * block_size, block_size))
-    return f"{prefix}-{key_body}"
-
 def _parse_semver(s: Optional[str]) -> tuple[int, int, int]:
     if not s:
         return (0, 0, 0)
@@ -140,9 +140,19 @@ def _version_lte(a: Optional[str], b: Optional[str]) -> bool:
     """a <= b theo semver đơn giản x.y.z."""
     return _parse_semver(a) <= _parse_semver(b)
 
-def _public_license_dict(lic: License, db: Session, app_ver: Optional[str] = None) -> dict:
-    expired = bool(lic.expires_at and lic.expires_at < now_utc())
+def scalar_int(db: Session, stmt) -> int:
+    """Lấy về 1 số nguyên từ SELECT COUNT(*) ... an toàn cho mọi driver."""
+    res = db.exec(stmt)
+    if hasattr(res, "scalar_one"):
+        try:
+            return int(res.scalar_one() or 0)
+        except Exception:
+            pass
+    val = res.one()
+    return int((val[0] if isinstance(val, tuple) else val) or 0)
 
+def _public_license_dict(lic: License, db: Session, app_ver: Optional[str] = None) -> dict:
+    expired = bool(lic.expires_at and lic.expires_at < now_naive_utc())
     used_devices_count = scalar_int(db, select(func.count(Device.id)).where(Device.license_id == lic.id))
 
     resp = {
@@ -152,7 +162,7 @@ def _public_license_dict(lic: License, db: Session, app_ver: Optional[str] = Non
         "max_devices": lic.max_devices,
         "used_devices": used_devices_count,
         "max_version": lic.max_version,
-        "expires_at": to_iso_z(lic.expires_at),
+        "expires_at": to_iso_z_naive(lic.expires_at),
         "license": lic.license,
         "kid": KID,
         "now": int(time.time()),
@@ -162,18 +172,6 @@ def _public_license_dict(lic: License, db: Session, app_ver: Optional[str] = Non
         resp["app_ver"] = app_ver
         resp["app_allowed"] = _version_lte(app_ver, lic.max_version)
     return resp
-
-def scalar_int(db: Session, stmt) -> int:
-    """Lấy về 1 số nguyên từ SELECT COUNT(*) ... an toàn cho mọi driver."""
-    res = db.exec(stmt)
-    # SQLAlchemy 2.x / SQLModel mới có scalar_one()
-    if hasattr(res, "scalar_one"):
-        try:
-            return int(res.scalar_one() or 0)
-        except Exception:
-            pass
-    val = res.one()
-    return int((val[0] if isinstance(val, tuple) else val) or 0)
 
 # ================== App ==================
 BOOT_TS = time.time()
@@ -359,7 +357,7 @@ def create_license(data: LicenseCreate, db: Session = Depends(get_session)):
     if data.notes is not None:
         lic.notes = data.notes
     if data.expires_days:
-        base = now_utc_minute()
+        base = now_naive_utc_minute()
         lic.expires_at = base + dt.timedelta(days=data.expires_days)
 
     try:
@@ -380,9 +378,9 @@ def create_license(data: LicenseCreate, db: Session = Depends(get_session)):
         "plan": lic.plan,
         "max_devices": lic.max_devices,
         "max_version": lic.max_version,
-        "expires_at": to_iso_z(lic.expires_at),
+        "expires_at": to_iso_z_naive(lic.expires_at),
         "notes": lic.notes,
-        "created_at": lic.created_at.isoformat() + "Z" if getattr(lic, "created_at", None) else None,
+        "created_at": to_iso_z_naive(getattr(lic, "created_at", None)),
     }
 
 @app.get("/licenses", response_model=LicenseListResponse, dependencies=[Depends(admin_auth)])
@@ -404,10 +402,7 @@ def list_licenses(
     sort_dir: str = Query("desc", pattern="^(asc|desc)$"),
 ):
     def _iso(x: Optional[dt.datetime]) -> Optional[str]:
-        if not x:
-            return None
-        # Chuẩn hóa ISO dạng UTC naive + 'Z' (đồng bộ với các field khác của bạn)
-        return x.isoformat() + "Z"
+        return to_iso_z_naive(x)
 
     # ----- Build bộ lọc -----
     filters = []
@@ -423,7 +418,7 @@ def list_licenses(
     if created_to:
         filters.append(License.created_at <= created_to)
     if expires_from:
-        filters.append(License.expires_at != None)  # tránh so sánh NULL
+        filters.append(License.expires_at != None)
         filters.append(License.expires_at >= expires_from)
     if expires_to:
         filters.append(License.expires_at != None)
@@ -436,7 +431,7 @@ def list_licenses(
     if where_clause is not None:
         count_stmt = count_stmt.where(where_clause)
     total = db.exec(count_stmt).one()
-    if isinstance(total, tuple):  # phòng khi driver trả về tuple
+    if isinstance(total, tuple):
         total = total[0]
     total = int(total)
 
@@ -458,7 +453,7 @@ def list_licenses(
 
     licenses: List[License] = db.exec(stmt).all()
 
-    # ----- Tính used_devices cho tất cả key trong 1 query -----
+    # ----- Tính used_devices -----
     if licenses:
         lic_ids = [lic.id for lic in licenses]
         cnt_stmt = (
@@ -466,7 +461,7 @@ def list_licenses(
             .where(Device.license_id.in_(lic_ids))
             .group_by(Device.license_id)
         )
-        counts = dict(db.exec(cnt_stmt).all())  # {license_id: count}
+        counts = dict(db.exec(cnt_stmt).all())
     else:
         counts = {}
 
@@ -510,12 +505,12 @@ def update_license(key: str, data: LicenseUpdate, db: Session = Depends(get_sess
 
     for k, v in data.model_dump(exclude_unset=True).items():
         if k == "expires_days" and v is not None:
-            base = now_utc_minute()
+            base = now_naive_utc_minute()
             lic.expires_at = base + dt.timedelta(days=v)
         elif k != "expires_days":
             setattr(lic, k, v)
 
-    lic.updated_at = now_utc()
+    lic.updated_at = now_naive_utc()
     db.add(lic); db.commit(); db.refresh(lic)
     return {"ok": True}
 
@@ -545,12 +540,18 @@ def list_activations(key: Optional[str] = Query(None), db: Session = Depends(get
     return db.exec(stmt.order_by(Activation.created_at.desc())).all()
 
 # ================== Public: Activate / Validate / Deactivate ==================
+def generate_short_key(prefix: str = "TKT", blocks: int = 4, block_size: int = 4) -> str:
+    """Base32 (A-Z, 2-7), bỏ '='. 10 bytes -> 16 ký tự base32 => 4 block x 4"""
+    raw = base64.b32encode(os.urandom(10)).decode().rstrip("=")
+    key_body = "-".join(raw[i:i+block_size] for i in range(0, blocks * block_size, block_size))
+    return f"{prefix}-{key_body}"
+
 @app.post("/activate")
 def activate(data: ActivateIn, db: Session = Depends(get_session)):
     lic = db.exec(select(License).where(License.key == data.key)).first()
     if not lic or lic.status != "active":
         raise HTTPException(403, "License invalid")
-    if lic.expires_at and lic.expires_at < now_utc():
+    if lic.expires_at and lic.expires_at < now_naive_utc():
         raise HTTPException(403, "License expired")
 
     actives: List[Activation] = db.exec(select(Activation).where(Activation.license_key == lic.key)).all()
@@ -583,7 +584,7 @@ def validate_token(data: ValidateIn, db: Session = Depends(get_session)):
     if not act:
         raise HTTPException(403, "Device not activated")
 
-    act.last_seen_at = now_utc()
+    act.last_seen_at = now_naive_utc()
     db.add(act); db.commit()
 
     return {"ok": True, "plan": lic.plan, "max_devices": lic.max_devices, "kid": payload.get("kid")}
@@ -595,76 +596,4 @@ def deactivate(data: DeactivateIn, db: Session = Depends(get_session)):
     ).first()
     if not act:
         raise HTTPException(404, "Activation not found")
-    db.delete(act); db.commit()
-    return {"ok": True}
-
-@app.post("/license/lookup")
-def license_lookup(data: LicenseLookupIn, db: Session = Depends(get_session)):
-    lic = db.exec(select(License).where(License.key == data.key)).first()
-    if not lic:
-        raise HTTPException(404, "Not found")
-    if lic.status != "active":
-        raise HTTPException(403, "License invalid")
-    return _public_license_dict(lic, db, data.app_ver)
-
-@app.get("/licenses/{key}/public")
-def get_license_public(key: str, app_ver: Optional[str] = None, db: Session = Depends(get_session)):
-    lic = db.exec(select(License).where(License.key == key)).first()
-    if not lic:
-        raise HTTPException(404, "Not found")
-    if lic.status != "active":
-        raise HTTPException(403, "License invalid")
-    return _public_license_dict(lic, db, app_ver)
-
-@app.post("/devices/register")
-def register_device(data: DeviceRegisterIn, db: Session = Depends(get_session)):
-    # Tìm license
-    lic = db.exec(select(License).where(License.key == data.key)).first()
-    if not lic or lic.status != "active":
-        raise HTTPException(403, "License invalid")
-    if lic.expires_at and lic.expires_at < now_utc():
-        raise HTTPException(403, "License expired")
-
-    # Upsert theo (license_id, hwid)
-    dev = db.exec(
-        select(Device).where(Device.license_id == lic.id, Device.hwid == data.hwid)
-    ).first()
-
-    if not dev:
-        # kiểm tra seats
-        used = scalar_int(db, select(func.count(Device.id)).where(Device.license_id == lic.id))
-        if used >= lic.max_devices:
-            raise HTTPException(403, f"Seats reached ({lic.max_devices})")
-
-        dev = Device(
-            license_id=lic.id,
-            hwid=data.hwid,
-            hostname=data.hostname,
-            platform=data.platform,
-            app_ver=data.app_ver,
-        )
-        db.add(dev)
-        db.commit()
-        db.refresh(dev)
-    else:
-        # update thông tin + last_seen
-        changed = False
-        if data.hostname and data.hostname != dev.hostname:
-            dev.hostname = data.hostname; changed = True
-        if data.platform and data.platform != dev.platform:
-            dev.platform = data.platform; changed = True
-        if data.app_ver and data.app_ver != dev.app_ver:
-            dev.app_ver = data.app_ver; changed = True
-        dev.last_seen_at = now_utc(); changed = True
-        if changed:
-            db.add(dev); db.commit(); db.refresh(dev)
-
-    used_after = scalar_int(db, select(func.count(Device.id)).where(Device.license_id == lic.id))
-
-    return {
-        "ok": True,
-        "license_key": lic.key,
-        "device_id": dev.id,
-        "used_devices": used_after,
-        "max_devices": lic.max_devices,
-    }
+    db.delete(act); db.com
