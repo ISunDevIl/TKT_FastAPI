@@ -5,9 +5,9 @@ import base64
 import datetime as dt
 from typing import Optional, List
 
-from fastapi import FastAPI, HTTPException, Depends, Query, Response, Header
+from fastapi import FastAPI, HTTPException, Depends, Query, Response, Header, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.responses import HTMLResponse, FileResponse, RedirectResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
 from pydantic import BaseModel, Field as PydField
@@ -37,6 +37,19 @@ if ZoneInfo:
         LOCAL_TZ = timezone(timedelta(hours=7))
 else:
     LOCAL_TZ = timezone(timedelta(hours=7))
+# ============ Download redirect config ============
+GITHUB_OWNER = os.getenv("GITHUB_OWNER", "ISunDevIl")
+GITHUB_REPO  = os.getenv("GITHUB_REPO",  "TKT_Files_Tools")
+GITHUB_ASSET = os.getenv("GITHUB_ASSET", "TKTApp_Installer.exe")
+
+def _gh_latest_asset_url(owner: str, repo: str, asset: str) -> str:
+    # Link “latest” ổn định, GitHub sẽ 302 tới file thực tế
+    return f"https://github.com/{owner}/{repo}/releases/latest/download/{asset}"
+
+def _gh_tag_asset_url(owner: str, repo: str, tag: str, asset: str) -> str:
+    # Link tới một tag/version cụ thể (vd: v1.2.3)
+    return f"https://github.com/{owner}/{repo}/releases/download/{tag}/{asset}"
+
 
 def now_local() -> dt.datetime:
     """Datetime tz-aware tại Asia/Bangkok."""
@@ -122,6 +135,13 @@ class Activation(SQLModel, table=True):
         UniqueConstraint("license_key", "hwid", name="uq_activation_license_hwid"),
         Index("ix_activation_created_at", "created_at"),
     )
+class DownloadLog(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    path: str = Field(index=True, max_length=255)
+    ua: Optional[str] = Field(default=None)
+    ip: Optional[str] = Field(default=None)
+    ref: Optional[str] = Field(default=None)
+    created_at: dt.datetime = Field(default_factory=now_local_naive, index=True)
 
 # ================== Auth ==================
 bearer = HTTPBearer(auto_error=False)
@@ -190,6 +210,13 @@ def _public_license_dict(lic: License, db: Session, app_ver: Optional[str] = Non
         resp["app_ver"] = app_ver
         resp["app_allowed"] = _version_lte(app_ver, lic.max_version)
     return resp
+
+def _client_ip(request: Request) -> str:
+    # Render/Proxy thường gửi X-Forwarded-For
+    xff = request.headers.get("X-Forwarded-For")
+    if xff:
+        return xff.split(",")[0].strip()
+    return getattr(request.client, "host", "") or ""
 
 # ================== App ==================
 BOOT_TS = time.time()
@@ -271,6 +298,7 @@ def index():
     <li><a href="/ready">/ready</a></li>
     <li><a href="/docs">/docs</a></li>
     <li><a href="/admin">/admin</a> (thêm header Authorization: Bearer ...)</li>
+    <li><a href="/download">/download</a> (trang tải xuống)</li>
   </ul>
 </body></html>"""
 
@@ -691,3 +719,81 @@ def register_device(data: DeviceRegisterIn, db: Session = Depends(get_session)):
         "used_devices": used_after,
         "max_devices": lic.max_devices,
     }
+# ================== Download Redirect ==================
+
+@app.get("/download", response_class=HTMLResponse)
+def download_page():
+    latest_url = _gh_latest_asset_url(GITHUB_OWNER, GITHUB_REPO, GITHUB_ASSET)
+    return f"""<!doctype html>
+<html><head><meta charset="utf-8"><title>Tải xuống</title></head>
+<body style="font-family:system-ui; max-width:720px; margin:40px auto; line-height:1.6">
+  <h1>⬇ Tải phần mềm</h1>
+  <ul>
+    <li><a href="/download/myapp">Tải bản mới nhất (.exe)</a></li>
+    <li>Hoặc trỏ thẳng GitHub: <code>{latest_url}</code></li>
+  </ul>
+  <p>Mẹo: Nếu trình duyệt cảnh báo, hãy chọn “Giữ lại” (Keep) hoặc đóng gói .zip khi phát hành.</p>
+</body></html>"""
+
+@app.get("/download/myapp")
+def download_latest(request: Request, db: Session = Depends(get_session)):
+    """
+    Redirect 302 tới asset mới nhất: https://github.com/<owner>/<repo>/releases/latest/download/<asset>
+    """
+    url = _gh_latest_asset_url(GITHUB_OWNER, GITHUB_REPO, GITHUB_ASSET)
+
+    # ghi log
+    try:
+        db.add(DownloadLog(
+            path="/download/myapp",
+            ua=request.headers.get("User-Agent"),
+            ip=_client_ip(request),
+            ref=request.headers.get("Referer"),
+        ))
+        db.commit()
+    except Exception:
+        db.rollback()
+        # không chặn tải nếu ghi log lỗi
+
+    return RedirectResponse(url, status_code=302)
+
+@app.get("/download/{tag}")
+def download_by_tag(tag: str, request: Request, db: Session = Depends(get_session)):
+    """
+    Redirect 302 tới asset ở một phiên bản cụ thể (ví dụ tag=v1.2.3)
+    """
+    url = _gh_tag_asset_url(GITHUB_OWNER, GITHUB_REPO, tag, GITHUB_ASSET)
+
+    try:
+        db.add(DownloadLog(
+            path=f"/download/{tag}",
+            ua=request.headers.get("User-Agent"),
+            ip=_client_ip(request),
+            ref=request.headers.get("Referer"),
+        ))
+        db.commit()
+    except Exception:
+        db.rollback()
+
+    return RedirectResponse(url, status_code=302)
+
+@app.get("/download/{tag}/{asset}")
+def download_by_tag_asset(tag: str, asset: str, request: Request, db: Session = Depends(get_session)):
+    """
+    Trường hợp bạn có nhiều file trong một release (VD: .exe, .zip),
+    cho phép chỉ định tên asset khác GITHUB_ASSET.
+    """
+    url = _gh_tag_asset_url(GITHUB_OWNER, GITHUB_REPO, tag, asset)
+
+    try:
+        db.add(DownloadLog(
+            path=f"/download/{tag}/{asset}",
+            ua=request.headers.get("User-Agent"),
+            ip=_client_ip(request),
+            ref=request.headers.get("Referer"),
+        ))
+        db.commit()
+    except Exception:
+        db.rollback()
+
+    return RedirectResponse(url, status_code=302)
