@@ -23,22 +23,46 @@ from sqladmin import Admin, ModelView
 from security import load_keys_from_env, kid_from_pub, sign_token, verify_token
 
 # ==== Thời gian: dùng tkt_time (kèm fallback) ====
-from datetime import timezone
+import datetime as dt
+from datetime import timezone, timedelta
+try:
+    from zoneinfo import ZoneInfo
+except Exception:
+    ZoneInfo = None
 from utilities.tkt_time import utc_now, utc_now_floor_minute, to_iso_z
+if ZoneInfo:
+    try:
+        LOCAL_TZ = ZoneInfo("Asia/Bangkok")
+    except Exception:
+        LOCAL_TZ = timezone(timedelta(hours=7))
+else:
+    LOCAL_TZ = timezone(timedelta(hours=7))
 
-def now_naive_utc() -> dt.datetime:
-    """UTC aware -> UTC naive (để lưu/so sánh trong DB)"""
-    return utc_now().replace(tzinfo=None)
+def now_local() -> dt.datetime:
+    """Datetime tz-aware tại Asia/Bangkok."""
+    return dt.datetime.now(LOCAL_TZ)
 
-def now_naive_utc_minute() -> dt.datetime:
-    """UTC aware (floor minute) -> UTC naive"""
-    return utc_now_floor_minute().replace(tzinfo=None)
+def now_local_minute() -> dt.datetime:
+    d = now_local()
+    return d.replace(second=0, microsecond=0)
 
-def to_iso_z_naive(x: Optional[dt.datetime]) -> Optional[str]:
-    """Datetime naive (giả định UTC) -> ISO Z"""
+def now_local_naive() -> dt.datetime:
+    """Giờ Asia/Bangkok nhưng NAIVE (không tzinfo) để lưu DB & so sánh."""
+    return now_local().replace(tzinfo=None)
+
+def now_local_minute_naive() -> dt.datetime:
+    """Asia/Bangkok, cắt tới phút, NAIVE."""
+    return now_local_minute().replace(tzinfo=None)
+
+def to_iso_local_naive(x: dt.datetime | None) -> str | None:
+    """
+    Nhận datetime NAIVE (được hiểu là Asia/Bangkok) -> ISO có offset +07:00.
+    """
     if not x:
         return None
-    return to_iso_z(x.replace(tzinfo=timezone.utc))
+    aware = x.replace(tzinfo=LOCAL_TZ)
+    # seconds cho gọn: 2025-09-15T12:34:00+07:00
+    return aware.isoformat(timespec="seconds")
 
 
 # ================== Config ==================
@@ -63,12 +87,8 @@ class License(SQLModel, table=True):
     max_devices: int = Field(default=1)
     expires_at: Optional[dt.datetime] = Field(default=None)
     notes: Optional[str] = Field(default=None)
-    created_at: dt.datetime = Field(
-        sa_column=Column(DateTime(), server_default=func.now(), nullable=False)
-    )
-    updated_at: dt.datetime = Field(
-        sa_column=Column(DateTime(), server_default=func.now(), onupdate=func.now(), nullable=False)
-    )
+    created_at: dt.datetime = Field(default_factory=now_local_naive, index=True)
+    updated_at: dt.datetime = Field(default_factory=now_local_naive, index=True)
 
     __table_args__ = (
         CheckConstraint("status in ('active','revoked','deleted')", name="ck_license_status"),
@@ -84,7 +104,7 @@ class Device(SQLModel, table=True):
     hostname: Optional[str] = None
     platform: Optional[str] = None
     app_ver: Optional[str] = None
-    created_at: dt.datetime = Field(default_factory=now_naive_utc, index=True)
+    created_at: dt.datetime = Field(default_factory=now_local_naive, index=True)
     last_seen_at: Optional[dt.datetime] = None
 
     __table_args__ = (
@@ -95,10 +115,8 @@ class Activation(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
     license_key: str = Field(index=True, max_length=64)
     hwid: str = Field(max_length=255)
-    created_at: dt.datetime = Field(
-        sa_column=Column(DateTime(timezone=False), server_default=func.now(), nullable=False)
-    )
-    last_seen_at: Optional[dt.datetime] = Field(default=None)
+    created_at: dt.datetime = Field(default_factory=now_local_naive, index=True)
+    last_seen_at: Optional[dt.datetime] = None
 
     __table_args__ = (
         UniqueConstraint("license_key", "hwid", name="uq_activation_license_hwid"),
@@ -152,7 +170,7 @@ def scalar_int(db: Session, stmt) -> int:
     return int((val[0] if isinstance(val, tuple) else val) or 0)
 
 def _public_license_dict(lic: License, db: Session, app_ver: Optional[str] = None) -> dict:
-    expired = bool(lic.expires_at and lic.expires_at < now_naive_utc())
+    expired = bool(lic.expires_at and lic.expires_at < now_local_naive())
     used_devices_count = scalar_int(db, select(func.count(Device.id)).where(Device.license_id == lic.id))
 
     resp = {
@@ -162,7 +180,7 @@ def _public_license_dict(lic: License, db: Session, app_ver: Optional[str] = Non
         "max_devices": lic.max_devices,
         "used_devices": used_devices_count,
         "max_version": lic.max_version,
-        "expires_at": to_iso_z_naive(lic.expires_at),
+        "expires_at": to_iso_local_naive(lic.expires_at),
         "license": lic.license,
         "kid": KID,
         "now": int(time.time()),
@@ -357,7 +375,7 @@ def create_license(data: LicenseCreate, db: Session = Depends(get_session)):
     if data.notes is not None:
         lic.notes = data.notes
     if data.expires_days:
-        base = now_naive_utc_minute()
+        base = now_local_minute_naive() 
         lic.expires_at = base + dt.timedelta(days=data.expires_days)
 
     try:
@@ -378,9 +396,9 @@ def create_license(data: LicenseCreate, db: Session = Depends(get_session)):
         "plan": lic.plan,
         "max_devices": lic.max_devices,
         "max_version": lic.max_version,
-        "expires_at": to_iso_z_naive(lic.expires_at),
+        "expires_at": to_iso_local_naive(lic.expires_at),
         "notes": lic.notes,
-        "created_at": to_iso_z_naive(getattr(lic, "created_at", None)),
+        "created_at": to_iso_local_naive(getattr(lic, "created_at", None)),
     }
 
 @app.get("/licenses", response_model=LicenseListResponse, dependencies=[Depends(admin_auth)])
@@ -402,7 +420,7 @@ def list_licenses(
     sort_dir: str = Query("desc", pattern="^(asc|desc)$"),
 ):
     def _iso(x: Optional[dt.datetime]) -> Optional[str]:
-        return to_iso_z_naive(x)
+        return to_iso_local_naive(x)
 
     # ----- Build bộ lọc -----
     filters = []
@@ -505,12 +523,12 @@ def update_license(key: str, data: LicenseUpdate, db: Session = Depends(get_sess
 
     for k, v in data.model_dump(exclude_unset=True).items():
         if k == "expires_days" and v is not None:
-            base = now_naive_utc_minute()
+            base = now_local_minute_naive()
             lic.expires_at = base + dt.timedelta(days=v)
         elif k != "expires_days":
             setattr(lic, k, v)
 
-    lic.updated_at = now_naive_utc()
+    lic.updated_at = now_local_naive() 
     db.add(lic); db.commit(); db.refresh(lic)
     return {"ok": True}
 
@@ -551,7 +569,7 @@ def activate(data: ActivateIn, db: Session = Depends(get_session)):
     lic = db.exec(select(License).where(License.key == data.key)).first()
     if not lic or lic.status != "active":
         raise HTTPException(403, "License invalid")
-    if lic.expires_at and lic.expires_at < now_naive_utc():
+    if lic.expires_at and lic.expires_at < now_local_naive():
         raise HTTPException(403, "License expired")
 
     actives: List[Activation] = db.exec(select(Activation).where(Activation.license_key == lic.key)).all()
@@ -584,7 +602,7 @@ def validate_token(data: ValidateIn, db: Session = Depends(get_session)):
     if not act:
         raise HTTPException(403, "Device not activated")
 
-    act.last_seen_at = now_naive_utc()
+    act.last_seen_at = now_local_naive()
     db.add(act); db.commit()
 
     return {"ok": True, "plan": lic.plan, "max_devices": lic.max_devices, "kid": payload.get("kid")}
@@ -627,7 +645,7 @@ def register_device(data: DeviceRegisterIn, db: Session = Depends(get_session)):
     lic = db.exec(select(License).where(License.key == data.key)).first()
     if not lic or lic.status != "active":
         raise HTTPException(403, "License invalid")
-    if lic.expires_at and lic.expires_at < now_naive_utc():
+    if lic.expires_at and lic.expires_at < now_local_naive():
         raise HTTPException(403, "License expired")
 
     # Upsert theo (license_id, hwid)
@@ -660,7 +678,7 @@ def register_device(data: DeviceRegisterIn, db: Session = Depends(get_session)):
             dev.platform = data.platform; changed = True
         if data.app_ver and data.app_ver != dev.app_ver:
             dev.app_ver = data.app_ver; changed = True
-        dev.last_seen_at = now_naive_utc(); changed = True
+        dev.last_seen_at = now_local_naive(); changed = True
         if changed:
             db.add(dev); db.commit(); db.refresh(dev)
 
