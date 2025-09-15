@@ -287,20 +287,99 @@ def ready():
 def index():
     uptime = round(time.time() - BOOT_TS, 2)
     return f"""<!doctype html>
-<html><head><meta charset="utf-8"><title>TKT FastAPI</title></head>
-<body style="font-family:system-ui; max-width:720px; margin:40px auto; line-height:1.6">
-  <h1>✅ TKT FastAPI is live</h1>
-  <h4>When you die, you can't see sunsets. </h4>
-  <p>Uptime: <b>{uptime}s</b></p>
-  <p>Active KID: <code>{KID}</code></p>
-  <ul>
-    <li><a href="/healthz">/healthz</a></li>
-    <li><a href="/ready">/ready</a></li>
-    <li><a href="/docs">/docs</a></li>
-    <li><a href="/admin">/admin</a> (thêm header Authorization: Bearer ...)</li>
-    <li><a href="/download">/download</a> (trang tải xuống)</li>
-  </ul>
-</body></html>"""
+<html lang="vi">
+<head>
+    <meta charset="utf-8">
+    <title>TKT FastAPI</title>
+    <style>
+        body {{
+            font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, 'Open Sans', 'Helvetica Neue', sans-serif;
+            max-width: 720px;
+            margin: 40px auto;
+            line-height: 1.6;
+            color: #333;
+            background-color: #f9f9f9;
+            padding: 20px;
+        }}
+        h1 {{
+            color: #28a745; /* Green for success/live */
+            font-size: 2.5em;
+            margin-bottom: 10px;
+            display: flex;
+            align-items: center;
+        }}
+        h1::before {{
+            content: "✅ ";
+            margin-right: 10px;
+        }}
+        h4 {{
+            font-style: italic;
+            color: #666;
+            margin-top: 0;
+            margin-bottom: 20px;
+        }}
+        p {{
+            margin: 10px 0;
+            font-size: 1.1em;
+        }}
+        code {{
+            background-color: #e9ecef;
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-family: monospace;
+        }}
+        ul {{
+            list-style-type: none;
+            padding: 0;
+            margin: 20px 0;
+        }}
+        li {{
+            margin-bottom: 10px;
+        }}
+        a {{
+            display: inline-block;
+            text-decoration: none;
+            color: #007bff;
+            background-color: #fff;
+            padding: 10px 15px;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            transition: background-color 0.3s, color 0.3s;
+        }}
+        a:hover {{
+            background-color: #007bff;
+            color: #fff;
+        }}
+        .note {{
+            font-size: 0.9em;
+            color: #555;
+            margin-left: 10px;
+        }}
+        .container {{
+            background-color: #fff;
+            padding: 30px;
+            border-radius: 10px;
+            box-shadow: 0 2px 10px rgba(0, 0, 0, 0.1);
+        }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>TKT FastAPI đang hoạt động</h1>
+        <h4>Khi bạn chết, bạn không thể ngắm hoàng hôn nữa.</h4>
+        <p>Thời gian hoạt động: <b>{uptime} giây</b></p>
+        <p>KID đang hoạt động: <code>{KID}</code></p>
+        <ul>
+            <li><a href="/healthz">/healthz</a></li>
+            <li><a href="/ready">/ready</a></li>
+            <li><a href="/docs">/docs</a></li>
+            <li><a href="/admin">/admin</a> <span class="note">(thêm header Authorization: Bearer ...)</span></li>
+            <li><a href="/download">/download</a> <span class="note">(trang tải xuống)</span></li>
+        </ul>
+    </div>
+</body>
+</html>
+"""
 
 @app.head("/")
 def index_head():
