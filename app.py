@@ -366,7 +366,10 @@ def index():
 <body>
     <div class="container">
         <h1>TKT FastAPI đang hoạt động</h1>
-        <h4>Khi bạn chết, bạn không thể ngắm hoàng hôn nữa.</h4>
+        <h4>Bỗng nhận ra hương ổi</h4>
+        <h4>Phả vào trong gió se</h4>
+        <h4>Sương chùng chình qua ngõ</h4>
+        <h4>Hình như thu đã về.</h4>
         <p>Thời gian hoạt động: <b>{uptime} giây</b></p>
         <p>KID đang hoạt động: <code>{KID}</code></p>
         <ul>
