@@ -370,13 +370,8 @@ def index():
         <h4>Phả vào trong gió se</h4>
         <h4>Sương chùng chình qua ngõ</h4>
         <h4>Hình như thu đã về.</h4>
-        <p>Thời gian hoạt động: <b>{uptime} giây</b></p>
-        <p>KID đang hoạt động: <code>{KID}</code></p>
         <ul>
-            <li><a href="/healthz">/healthz</a></li>
-            <li><a href="/ready">/ready</a></li>
             <li><a href="/docs">/docs</a></li>
-            <li><a href="/admin">/admin</a> <span class="note">(thêm header Authorization: Bearer ...)</span></li>
             <li><a href="/download">/download</a> <span class="note">(trang tải xuống)</span></li>
         </ul>
     </div>
